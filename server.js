@@ -642,7 +642,7 @@ async function handleChatCompletions(request) {
 // ============ SERVER ============
 
 export default {
-    port: 7860,
+    port: process.env.PORT || 10000,
     async fetch(req) {
         const url = new URL(req.url)
 
@@ -728,4 +728,5 @@ export default {
             })
         }
     }
+
 }
