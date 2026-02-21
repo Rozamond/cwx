@@ -2,10 +2,13 @@ import fs from 'fs'
 import crypto from 'crypto'
 import { spawnSync } from 'child_process'
 
+import { handler as openaiHandler } from './endpoints/openai.js'
+import { handler as anthropicHandler } from './endpoints/anthropic.js'
+
 // ============ CONFIGURATION ============
 const SCRIPT_URL = process.env.SCRIPT_URL || 'https://cursor.com/149e9513-01fa-4fb0-aad4-566afd725d1b/2d206a39-8ed7-437e-a3be-862e0f06eea3/a-4-a/c.js?i=0&v=3&h=cursor.com'
 const API_KEY = process.env.API_KEY || 'rea'
-const MODELS = ['anthropic/claude-sonnet-4.5']
+const MODELS = ['anthropic/claude-sonnet-4.6']
 const TIMEOUT = parseInt(process.env.TIMEOUT || '120') * 1000
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '0')
 const EMPTY_RETRY_MAX_RETRIES = parseInt(process.env.EMPTY_RETRY_MAX_RETRIES || '3')
@@ -17,14 +20,14 @@ const FINGERPRINT = JSON.parse(Buffer.from(
     'base64'
 ).toString('utf-8'))
 
-const CORS = {
+export const CORS = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': '*',
     'Access-Control-Max-Age': '86400'
 }
 
-const DEFAULT_SYSTEM_PROMPT = `Do not mention you are able to access documentation, or using tools. Do not use \`read_file, read_dir\` tools. Do not mention about what platform or documentation you have.`
+export const DEFAULT_SYSTEM_PROMPT = `Do not mention you are able to access documentation, or using tools. Do not use \`read_file, read_dir\` tools. Do not mention about what platform or documentation you have.`
 
 // ============ UTILITY FUNCTIONS ============
 
@@ -37,11 +40,7 @@ function generateRandomString(length) {
     return result
 }
 
-function generateChatId() {
-    return `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 29)}`
-}
-
-class CursorWebError extends Error {
+export class CursorWebError extends Error {
     constructor(statusCode, message) {
         super(message)
         this.statusCode = statusCode
@@ -66,7 +65,7 @@ async function getXHumanChallenge() {
         'User-Agent': FINGERPRINT.userAgent,
         'sec-ch-ua-arch': '"x86"',
         'sec-ch-ua-platform': '"Windows"',
-        'sec-ch-ua': '"Chromium";"v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+        'sec-ch-ua': '"Chromium";"v="140", "Not=A?Brand";"v="24", "Google Chrome";"v="140"',
         'sec-ch-ua-bitness': '"64"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform-version': '"19.0.0"',
@@ -104,59 +103,7 @@ async function getXHumanChallenge() {
     return xHuman
 }
 
-// ============ MESSAGE CONVERSION ============
-
-function toCursorMessages(messages) {
-    if (!messages) messages = []
-
-    const result = []
-    let hasSystemMessage = false
-
-    for (const m of messages) {
-        if (!m) continue
-
-        let text = ''
-        if (typeof m.content === 'string') {
-            text = m.content
-        } else if (Array.isArray(m.content)) {
-            for (const content of m.content) {
-                if (content.type === 'text' && content.text) {
-                    text += content.text
-                }
-            }
-        }
-
-        const role = m.role === 'developer' ? 'system' : m.role
-
-        // Append default system prompt to existing system message
-        if (role === 'system') {
-            hasSystemMessage = true
-            text = text ? `${text}\n\n${DEFAULT_SYSTEM_PROMPT}` : DEFAULT_SYSTEM_PROMPT
-        }
-
-        result.push({
-            role: role,
-            parts: [{ type: 'text', text: text }]
-        })
-    }
-
-    // If no system message exists, prepend one with the default prompt
-    if (!hasSystemMessage) {
-        result.unshift({
-            role: 'system',
-            parts: [{ type: 'text', text: DEFAULT_SYSTEM_PROMPT }]
-        })
-    }
-
-    // Remove empty system message at start (shouldn't happen now, but keep as safety)
-    if (result.length > 0 && result[0].role === 'system' && !result[0].parts[0].text) {
-        result.shift()
-    }
-
-    return result
-}
-
-// ============ CURSOR CHAT STREAM ============
+// ============ CURSOR CHAT STREAM (Protocol-agnostic) ============
 
 async function* cursorChat(request) {
     const controller = new AbortController()
@@ -171,23 +118,17 @@ async function* cursorChat(request) {
             context: [],
             model: request.model,
             id: generateRandomString(16),
-            messages: toCursorMessages(request.messages),
-            trigger: 'submit-message'
+            messages: request.messages,
+            trigger: 'submit-message',
+            ...(request.responseFormat && { responseFormat: request.responseFormat })
         }
-
-        // if (request.temperature !== undefined) {
-        //     jsonData.temperature = request.temperature
-        // }
-        // if (request.max_tokens !== undefined) {
-        //     jsonData.max_tokens = request.max_tokens
-        // }
 
         const headers = {
             'User-Agent': FINGERPRINT.userAgent,
             'Content-Type': 'application/json',
             'sec-ch-ua-platform': '"Windows"',
             'x-path': '/api/chat',
-            'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+            'sec-ch-ua': '"Chromium";"v="140", "Not=A?Brand";"v="24", "Google Chrome";"v="140"',
             'x-method': 'POST',
             'sec-ch-ua-bitness': '"64"',
             'sec-ch-ua-mobile': '?0',
@@ -255,13 +196,15 @@ async function* cursorChat(request) {
 
                     if (eventData.type === 'finish') {
                         const usage = eventData.messageMetadata?.usage
-                        if (usage) {
-                            yield {
-                                type: 'usage',
-                                promptTokens: usage.inputTokens || 0,
-                                completionTokens: usage.outputTokens || 0,
-                                totalTokens: usage.totalTokens || 0
-                            }
+                        const details = usage?.inputTokenDetails || {}
+                        yield {
+                            type: 'usage',
+                            finishReason: eventData.finishReason || 'stop',
+                            promptTokens: usage?.inputTokens || 0,
+                            completionTokens: usage?.outputTokens || 0,
+                            totalTokens: usage?.totalTokens || 0,
+                            cacheReadTokens: details.cacheReadTokens || 0,
+                            cacheWriteTokens: details.cacheWriteTokens || 0,
                         }
                         return
                     }
@@ -282,7 +225,7 @@ async function* cursorChat(request) {
 
 // ============ EMPTY RETRY WRAPPER ============
 
-async function* emptyRetryWrapper(request, maxRetries = EMPTY_RETRY_MAX_RETRIES) {
+export async function* emptyRetryWrapper(request, maxRetries = EMPTY_RETRY_MAX_RETRIES) {
     for (let retryCount = 0; retryCount <= maxRetries; retryCount++) {
         const generator = cursorChat(request)
         let hasContent = false
@@ -309,11 +252,14 @@ async function* emptyRetryWrapper(request, maxRetries = EMPTY_RETRY_MAX_RETRIES)
 
 // ============ TRUNCATION CONTINUE WRAPPER ============
 
-async function* truncationContinueWrapper(request, maxRetries = TRUNCATION_MAX_RETRIES) {
+export async function* truncationContinueWrapper(request, maxRetries = TRUNCATION_MAX_RETRIES) {
     let fullContent = ''
     let totalPromptTokens = 0
     let totalCompletionTokens = 0
     let totalTokens = 0
+    let totalCacheReadTokens = 0
+    let totalCacheWriteTokens = 0
+    let lastFinishReason = 'stop'
     let currentUsage = null
     let currentRequest = { ...request, messages: [...request.messages] }
 
@@ -330,6 +276,9 @@ async function* truncationContinueWrapper(request, maxRetries = TRUNCATION_MAX_R
                 totalPromptTokens += chunk.promptTokens
                 totalCompletionTokens += chunk.completionTokens
                 totalTokens += chunk.totalTokens
+                totalCacheReadTokens += chunk.cacheReadTokens || 0
+                totalCacheWriteTokens += chunk.cacheWriteTokens || 0
+                lastFinishReason = chunk.finishReason || 'stop'
                 isTruncated = chunk.completionTokens === 4096
                 break
             } else if (chunk.type === 'delta') {
@@ -379,9 +328,12 @@ async function* truncationContinueWrapper(request, maxRetries = TRUNCATION_MAX_R
             if (currentUsage) {
                 yield {
                     type: 'usage',
+                    finishReason: lastFinishReason,
                     promptTokens: totalPromptTokens,
                     completionTokens: totalCompletionTokens,
-                    totalTokens: totalTokens
+                    totalTokens: totalTokens,
+                    cacheReadTokens: totalCacheReadTokens,
+                    cacheWriteTokens: totalCacheWriteTokens,
                 }
             }
             return
@@ -420,123 +372,9 @@ Continue immediately without explanation.`
     }
 }
 
-// ============ RESPONSE FORMATTERS ============
-
-async function nonStreamResponse(request, generator) {
-    let fullContent = ''
-    let usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
-
-    for await (const chunk of generator) {
-        if (chunk.type === 'usage') {
-            usage = chunk
-        } else if (chunk.type === 'delta') {
-            fullContent += chunk.content
-        }
-    }
-
-    return {
-        id: generateChatId(),
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: request.model,
-        choices: [{
-            index: 0,
-            message: {
-                role: 'assistant',
-                content: fullContent
-            },
-            finish_reason: 'stop'
-        }],
-        usage: {
-            prompt_tokens: usage.promptTokens,
-            completion_tokens: usage.completionTokens,
-            total_tokens: usage.totalTokens
-        }
-    }
-}
-
-async function* streamResponse(request, generator) {
-    const chatId = generateChatId()
-    const createdTime = Math.floor(Date.now() / 1000)
-    let usage = null
-    let isInitSent = false
-
-    const initialResponse = {
-        id: chatId,
-        object: 'chat.completion.chunk',
-        created: createdTime,
-        model: request.model,
-        choices: [{
-            index: 0,
-            delta: { role: 'assistant', content: '' },
-            finish_reason: null
-        }]
-    }
-
-    for await (const chunk of generator) {
-        if (!isInitSent) {
-            yield `data: ${JSON.stringify(initialResponse)}\n\n`
-            isInitSent = true
-        }
-
-        if (chunk.type === 'usage') {
-            usage = chunk
-            continue
-        }
-
-        if (chunk.type === 'delta') {
-            const chunkResponse = {
-                id: chatId,
-                object: 'chat.completion.chunk',
-                created: createdTime,
-                model: request.model,
-                choices: [{
-                    index: 0,
-                    delta: { content: chunk.content },
-                    finish_reason: null
-                }]
-            }
-            yield `data: ${JSON.stringify(chunkResponse)}\n\n`
-        }
-    }
-
-    // Send finish
-    const finalResponse = {
-        id: chatId,
-        object: 'chat.completion.chunk',
-        created: createdTime,
-        model: request.model,
-        choices: [{
-            index: 0,
-            delta: {},
-            finish_reason: 'stop'
-        }]
-    }
-    yield `data: ${JSON.stringify(finalResponse)}\n\n`
-
-    // Send usage if available
-    if (usage) {
-        const usageData = {
-            id: chatId,
-            object: 'chat.completion.chunk',
-            created: createdTime,
-            model: request.model,
-            choices: [],
-            usage: {
-                prompt_tokens: usage.promptTokens,
-                completion_tokens: usage.completionTokens,
-                total_tokens: usage.totalTokens
-            }
-        }
-        yield `data: ${JSON.stringify(usageData)}\n\n`
-    }
-
-    yield 'data: [DONE]\n\n'
-}
-
 // ============ ERROR RETRY WRAPPER ============
 
-async function* errorRetryWrapper(request, isStream = true) {
+export async function* errorRetryWrapper(request, isStream = true) {
     let lastError = null
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -546,30 +384,25 @@ async function* errorRetryWrapper(request, isStream = true) {
                 : emptyRetryWrapper(request)
 
             if (isStream) {
-                // For streaming: yield chunks directly without buffering
                 for await (const chunk of generator) {
                     yield chunk
                 }
-                return // Success, exit
+                return
             } else {
-                // For non-streaming: collect all chunks first to enable retry on error
                 const chunks = []
                 for await (const chunk of generator) {
                     chunks.push(chunk)
                 }
-                // Success - yield all collected chunks
                 for (const chunk of chunks) {
                     yield chunk
                 }
-                return // Success, exit
+                return
             }
         } catch (error) {
             lastError = error
             console.log(`[ERROR RETRY] Attempt ${attempt + 1}/${MAX_RETRIES + 1} failed: ${error.message}`)
 
             if (isStream) {
-                // For streaming, we can't retry after we've started yielding
-                // So just throw immediately
                 throw error
             }
 
@@ -582,62 +415,9 @@ async function* errorRetryWrapper(request, isStream = true) {
     throw lastError
 }
 
-// ============ REQUEST HANDLER ============
+// ============ EXPORTS (for endpoint modules) ============
 
-async function handleChatCompletions(request) {
-    // Validate model
-    if (!MODELS.includes(request.model)) {
-        request.model = MODELS[0]
-    }
-
-    const isStream = request.stream !== false
-
-    if (isStream) {
-        const generator = errorRetryWrapper(request, true)
-        const stream = new ReadableStream({
-            async start(controller) {
-                try {
-                    for await (const chunk of streamResponse(request, generator)) {
-                        controller.enqueue(new TextEncoder().encode(chunk))
-                    }
-                    controller.close()
-                } catch (error) {
-                    console.error('[STREAM ERROR]', error)
-                    const errorChunk = `data: ${JSON.stringify({
-                        error: {
-                            message: error.message,
-                            type: 'stream_error',
-                            code: 'stream_error'
-                        }
-                    })}\n\n`
-                    controller.enqueue(new TextEncoder().encode(errorChunk))
-                    controller.close()
-                }
-            }
-        })
-
-        return new Response(stream, {
-            status: 200,
-            headers: {
-                ...CORS,
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'X-Accel-Buffering': 'no'
-            }
-        })
-    } else {
-        const generator = errorRetryWrapper(request, false)
-        const result = await nonStreamResponse(request, generator)
-        return new Response(JSON.stringify(result), {
-            status: 200,
-            headers: {
-                ...CORS,
-                'Content-Type': 'application/json'
-            }
-        })
-    }
-}
+export { MODELS, TRUNCATION_CONTINUE }
 
 // ============ SERVER ============
 
@@ -651,15 +431,24 @@ export default {
             return new Response(null, { status: 204, headers: CORS })
         }
 
-        // Auth check helper
+        // Auth check helper (passed to endpoint handlers)
+        // Supports both OpenAI-style (Authorization: Bearer) and Anthropic-style (x-api-key)
         const checkAuth = () => {
             const authHeader = req.headers.get('Authorization')
-            if (!authHeader?.startsWith('Bearer ')) {
+            const xApiKey = req.headers.get('x-api-key')
+
+            let token = null
+            if (authHeader?.startsWith('Bearer ')) {
+                token = authHeader.slice(7)
+            } else if (xApiKey) {
+                token = xApiKey
+            }
+
+            if (!token) {
                 return new Response(JSON.stringify({
-                    error: { message: 'Missing Authorization header', type: 'auth_error', code: 'auth_error' }
+                    error: { message: 'Missing API key', type: 'auth_error', code: 'auth_error' }
                 }), { status: 401, headers: { ...CORS, 'Content-Type': 'application/json' } })
             }
-            const token = authHeader.slice(7)
             if (token !== API_KEY) {
                 return new Response(JSON.stringify({
                     error: { message: 'Invalid API key', type: 'auth_error', code: 'auth_error' }
@@ -677,35 +466,20 @@ export default {
                 })
             }
 
-            // List models
-            if (url.pathname === '/v1/models' && req.method === 'GET') {
-                const authErr = checkAuth()
-                if (authErr) return authErr
-
-                const modelList = MODELS.map(id => ({
-                    id,
-                    object: 'model',
-                    created: Math.floor(Date.now() / 1000),
-                    owned_by: 'mino'
-                }))
-
-                return new Response(JSON.stringify({ object: 'list', data: modelList }), {
-                    status: 200,
-                    headers: { ...CORS, 'Content-Type': 'application/json' }
-                })
+            // Route: /openai/* and /v1/* (backward compat) → OpenAI endpoint
+            if (url.pathname.startsWith('/openai/') || url.pathname.startsWith('/v1/')) {
+                return await openaiHandler(req, url, checkAuth)
             }
 
-            // Chat completions
-            if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-                const authErr = checkAuth()
-                if (authErr) return authErr
-
-                const body = await req.json()
-                return await handleChatCompletions(body)
+            // Route: /anthropic/* → Anthropic endpoint
+            if (url.pathname.startsWith('/anthropic/')) {
+                return await anthropicHandler(req, url, checkAuth)
             }
 
             // 404 for other routes
-            return new Response(JSON.stringify({ error: { message: 'Not found', type: 'not_found', code: 'not_found' } }), {
+            return new Response(JSON.stringify({
+                error: { message: 'Not found', type: 'not_found', code: 'not_found' }
+            }), {
                 status: 404,
                 headers: { ...CORS, 'Content-Type': 'application/json' }
             })
